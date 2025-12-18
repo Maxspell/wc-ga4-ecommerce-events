@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WooCommerce GA4 Ecommerce Events
  * Description: Scalable GA4 ecommerce events integration for WooCommerce (view_item_list, view_item, add_to_cart, remove_from_cart, begin_checkout, purchase).
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: Your Team
  * Text Domain: wc-ga4-ecommerce-events
  */
@@ -28,6 +28,9 @@ class WC_GA4_Ecommerce_Events {
             10,
             3
         );
+
+        // view_item – single product
+        add_action('wp_footer', [$this, 'view_item_single_product'], 20);
     }
 
     /**
@@ -80,18 +83,13 @@ class WC_GA4_Ecommerce_Events {
             return $query_args;
         }
 
-        if ($type !== 'products') {
-            return $query_args;
-        }
-
-        if (empty($atts['category'])) {
+        if ($type !== 'products' || empty($atts['category'])) {
             return $query_args;
         }
 
         add_action('wp_footer', function () use ($query_args, $atts) {
 
             $query = new WP_Query($query_args);
-
             if (!$query->have_posts()) {
                 return;
             }
@@ -102,37 +100,17 @@ class WC_GA4_Ecommerce_Events {
             while ($query->have_posts()) {
                 $query->the_post();
                 $product = wc_get_product(get_the_ID());
-                if (!$product) {
-                    continue;
-                }
+                if (!$product) continue;
 
-                // Categories
-                $terms = get_the_terms($product->get_id(), 'product_cat');
-                $main_category = '';
-                $item_category2 = '';
-
-                if ($terms) {
-                    foreach ($terms as $term) {
-                        if ($term->parent == 0) {
-                            $main_category = $term->name;
-                            break;
-                        }
-                    }
-                    foreach ($terms as $term) {
-                        if ($term->name !== $main_category) {
-                            $item_category2 = $term->name;
-                            break;
-                        }
-                    }
-                }
+                [$cat1, $cat2] = $this->get_product_categories($product);
 
                 $items[] = [
                     'item_id'        => (string) $product->get_id(),
                     'item_name'      => $product->get_name(),
                     'price'          => (float) $product->get_price(),
                     'item_brand'     => $product->get_attribute('pa_brand') ?: '',
-                    'item_category'  => $main_category,
-                    'item_category2' => $item_category2,
+                    'item_category'  => $cat1,
+                    'item_category2' => $cat2,
                     'item_list_id'   => 'home_' . sanitize_title($atts['category']),
                     'item_list_name' => 'Home – ' . ucfirst($atts['category']),
                     'index'          => $index,
@@ -144,7 +122,7 @@ class WC_GA4_Ecommerce_Events {
 
             wp_reset_postdata();
 
-            $this->print_datalayer($items);
+            $this->print_datalayer('view_item_list', $items);
         }, 20);
 
         return $query_args;
@@ -152,7 +130,40 @@ class WC_GA4_Ecommerce_Events {
 
     /**
      * =========================
-     * CORE: Build & Output view_item_list
+     * VIEW ITEM – SINGLE PRODUCT
+     * =========================
+     */
+    public function view_item_single_product() {
+
+        if (!is_product()) {
+            return;
+        }
+
+        global $product;
+
+        if (!$product instanceof WC_Product) {
+            return;
+        }
+
+        [$cat1, $cat2] = $this->get_product_categories($product);
+
+        $item = [
+            'item_id'        => (string) $product->get_id(),
+            'item_name'      => $product->get_name(),
+            'price'          => (float) $product->get_price(),
+            'item_brand'     => $product->get_attribute('pa_brand') ?: '',
+            'item_category'  => $cat1,
+            'item_category2' => $cat2,
+            'item_variant'   => $product->get_attribute('pa_color') ?: '',
+            'google_business_vertical' => 'retail',
+        ];
+
+        $this->print_datalayer('view_item', [$item]);
+    }
+
+    /**
+     * =========================
+     * CORE: VIEW ITEM LIST
      * =========================
      */
     private function output_view_item_list($context) {
@@ -169,33 +180,15 @@ class WC_GA4_Ecommerce_Events {
             $product = wc_get_product($post->ID);
             if (!$product) continue;
 
-            // Categories
-            $terms = get_the_terms($product->get_id(), 'product_cat');
-            $main_category = '';
-            $item_category2 = '';
-
-            if ($terms) {
-                foreach ($terms as $term) {
-                    if ($term->parent == 0) {
-                        $main_category = $term->name;
-                        break;
-                    }
-                }
-                foreach ($terms as $term) {
-                    if ($term->name !== $main_category) {
-                        $item_category2 = $term->name;
-                        break;
-                    }
-                }
-            }
+            [$cat1, $cat2] = $this->get_product_categories($product);
 
             $items[] = [
                 'item_id'        => (string) $product->get_id(),
                 'item_name'      => $product->get_name(),
                 'price'          => (float) $product->get_price(),
                 'item_brand'     => $product->get_attribute('pa_brand') ?: '',
-                'item_category'  => $main_category,
-                'item_category2' => $item_category2,
+                'item_category'  => $cat1,
+                'item_category2' => $cat2,
                 'item_list_id'   => $this->get_list_id($context),
                 'item_list_name' => $this->get_list_name($context),
                 'index'          => $index,
@@ -205,7 +198,7 @@ class WC_GA4_Ecommerce_Events {
             $index++;
         }
 
-        $this->print_datalayer($items);
+        $this->print_datalayer('view_item_list', $items);
     }
 
     /**
@@ -213,7 +206,7 @@ class WC_GA4_Ecommerce_Events {
      * PRINT DATALAYER
      * =========================
      */
-    private function print_datalayer($items) {
+    private function print_datalayer($event, $items) {
         if (empty($items)) {
             return;
         }
@@ -224,7 +217,7 @@ class WC_GA4_Ecommerce_Events {
                 ecommerce: null
             });
             dataLayer.push({
-                event: 'view_item_list',
+                event: "<?php echo esc_js($event); ?>",
                 ecommerce: {
                     currency: "UAH",
                     items: <?php echo wp_json_encode($items, JSON_UNESCAPED_UNICODE); ?>
@@ -236,7 +229,36 @@ class WC_GA4_Ecommerce_Events {
 
     /**
      * =========================
-     * Helpers: list id & name
+     * PRODUCT CATEGORIES HELPER
+     * =========================
+     */
+    private function get_product_categories($product) {
+
+        $terms = get_the_terms($product->get_id(), 'product_cat');
+        $cat1 = '';
+        $cat2 = '';
+
+        if ($terms) {
+            foreach ($terms as $term) {
+                if ($term->parent == 0) {
+                    $cat1 = $term->name;
+                    break;
+                }
+            }
+            foreach ($terms as $term) {
+                if ($term->name !== $cat1) {
+                    $cat2 = $term->name;
+                    break;
+                }
+            }
+        }
+
+        return [$cat1, $cat2];
+    }
+
+    /**
+     * =========================
+     * LIST META
      * =========================
      */
     private function get_list_id($context) {

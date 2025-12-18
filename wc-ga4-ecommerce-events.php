@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WooCommerce GA4 Ecommerce Events
  * Description: Scalable GA4 ecommerce events integration for WooCommerce (view_item_list, view_item, add_to_cart, remove_from_cart, begin_checkout, purchase).
- * Version: 1.3.0
+ * Version: 1.4.0
  * Author: Your Team
  * Text Domain: wc-ga4-ecommerce-events
  */
@@ -13,6 +13,8 @@ if (!defined('ABSPATH')) {
 }
 
 class WC_GA4_Ecommerce_Events {
+
+    private $add_to_cart_items = [];
 
     public function __construct() {
 
@@ -31,68 +33,52 @@ class WC_GA4_Ecommerce_Events {
 
         // view_item – single product
         add_action('wp_footer', [$this, 'view_item_single_product'], 20);
+
+        // add_to_cart – capture (works for both AJAX and non-AJAX)
+        add_action('woocommerce_add_to_cart', [$this, 'capture_add_to_cart'], 10, 6);
+
+        // add_to_cart – output for non-AJAX (page reload)
+        add_action('wp_footer', [$this, 'output_add_to_cart'], 30);
+
+        // add_to_cart – AJAX support via fragments
+        add_filter('woocommerce_add_to_cart_fragments', [$this, 'add_to_cart_fragments'], 10, 1);
+
+        // add_to_cart – JavaScript for AJAX handling
+        add_action('wp_footer', [$this, 'add_to_cart_ajax_script'], 10);
     }
 
-    /**
-     * =========================
-     * VIEW ITEM LIST – SHOP
-     * =========================
-     */
-    public function view_item_list_shop() {
-        if (!is_shop() || is_search()) {
-            return;
-        }
+    /* ======================================================
+     * VIEW ITEM LIST – SHOP / CATEGORY / SEARCH
+     * ====================================================== */
 
+    public function view_item_list_shop() {
+        if (!is_shop() || is_search()) return;
         $this->output_view_item_list('shop_page');
     }
 
-    /**
-     * =========================
-     * VIEW ITEM LIST – CATEGORY
-     * =========================
-     */
     public function view_item_list_category() {
-        if (!is_product_category()) {
-            return;
-        }
-
+        if (!is_product_category()) return;
         $this->output_view_item_list('category_page');
     }
 
-    /**
-     * =========================
-     * VIEW ITEM LIST – SEARCH
-     * =========================
-     */
     public function view_item_list_search() {
-        if (!is_search()) {
-            return;
-        }
-
+        if (!is_search()) return;
         $this->output_view_item_list('search_page');
     }
 
-    /**
-     * ==================================================
-     * VIEW ITEM LIST – HOMEPAGE [products] SHORTCODES
-     * ==================================================
-     */
+    /* ======================================================
+     * VIEW ITEM LIST – HOMEPAGE SHORTCODES
+     * ====================================================== */
+
     public function capture_homepage_products_shortcode($query_args, $atts, $type) {
 
-        if (!is_front_page() && !is_home()) {
-            return $query_args;
-        }
-
-        if ($type !== 'products' || empty($atts['category'])) {
-            return $query_args;
-        }
+        if (!is_front_page() && !is_home()) return $query_args;
+        if ($type !== 'products' || empty($atts['category'])) return $query_args;
 
         add_action('wp_footer', function () use ($query_args, $atts) {
 
             $query = new WP_Query($query_args);
-            if (!$query->have_posts()) {
-                return;
-            }
+            if (!$query->have_posts()) return;
 
             $items = [];
             $index = 1;
@@ -128,22 +114,16 @@ class WC_GA4_Ecommerce_Events {
         return $query_args;
     }
 
-    /**
-     * =========================
+    /* ======================================================
      * VIEW ITEM – SINGLE PRODUCT
-     * =========================
-     */
+     * ====================================================== */
+
     public function view_item_single_product() {
 
-        if (!is_product()) {
-            return;
-        }
+        if (!is_product()) return;
 
         global $product;
-
-        if (!$product instanceof WC_Product) {
-            return;
-        }
+        if (!$product instanceof WC_Product) return;
 
         [$cat1, $cat2] = $this->get_product_categories($product);
 
@@ -161,17 +141,111 @@ class WC_GA4_Ecommerce_Events {
         $this->print_datalayer('view_item', [$item]);
     }
 
-    /**
-     * =========================
-     * CORE: VIEW ITEM LIST
-     * =========================
-     */
-    private function output_view_item_list($context) {
-        global $wp_query;
+    /* ======================================================
+     * ADD TO CART – CAPTURE (GLOBAL)
+     * ====================================================== */
 
-        if (empty($wp_query->posts)) {
+    public function capture_add_to_cart($cart_item_key, $product_id, $quantity, $variation_id, $variation, $cart_item_data) {
+
+        $product = wc_get_product($variation_id ?: $product_id);
+        if (!$product) return;
+
+        [$cat1, $cat2] = $this->get_product_categories($product);
+
+        $this->add_to_cart_items[] = [
+            'item_id'        => (string) $product->get_id(),
+            'item_name'      => $product->get_name(),
+            'price'          => (float) $product->get_price(),
+            'item_brand'     => $product->get_attribute('pa_brand') ?: '',
+            'item_category'  => $cat1,
+            'item_category2' => $cat2,
+            'item_variant'   => $product->get_attribute('pa_color') ?: '',
+            'quantity'       => (int) $quantity,
+            'google_business_vertical' => 'retail',
+        ];
+    }
+
+    /* ======================================================
+     * ADD TO CART – OUTPUT
+     * ====================================================== */
+
+    public function output_add_to_cart() {
+
+        if (empty($this->add_to_cart_items)) {
             return;
         }
+
+        $this->print_datalayer('add_to_cart', $this->add_to_cart_items);
+    }
+
+    /* ======================================================
+     * ADD TO CART – AJAX FRAGMENTS SUPPORT
+     * ====================================================== */
+
+    public function add_to_cart_fragments($fragments) {
+
+        if (empty($this->add_to_cart_items)) {
+            return $fragments;
+        }
+
+        // Return data as JSON in a hidden div (not a script to avoid auto-execution)
+        $fragments['div#ga4-add-to-cart-data'] = '<div id="ga4-add-to-cart-data" style="display:none;" data-items="' . esc_attr(wp_json_encode($this->add_to_cart_items, JSON_UNESCAPED_UNICODE)) . '"></div>';
+
+        // Clear the items after adding to fragments
+        $this->add_to_cart_items = [];
+
+        return $fragments;
+    }
+
+    /* ======================================================
+     * ADD TO CART – AJAX JAVASCRIPT HANDLER
+     * ====================================================== */
+
+    public function add_to_cart_ajax_script() {
+        ?>
+        <div id="ga4-add-to-cart-data" style="display:none;"></div>
+        <script>
+            (function() {
+                // Listen for WooCommerce AJAX add to cart events
+                jQuery(document.body).on('added_to_cart', function(event, fragments, cart_hash, $button) {
+                    // Check if our data fragment exists
+                    if (fragments && fragments['div#ga4-add-to-cart-data']) {
+                        var tempDiv = document.createElement('div');
+                        tempDiv.innerHTML = fragments['div#ga4-add-to-cart-data'];
+                        var dataEl = tempDiv.querySelector('#ga4-add-to-cart-data');
+                        
+                        if (dataEl && dataEl.dataset.items) {
+                            try {
+                                var items = JSON.parse(dataEl.dataset.items);
+                                if (items && items.length > 0) {
+                                    window.dataLayer = window.dataLayer || [];
+                                    dataLayer.push({ ecommerce: null });
+                                    dataLayer.push({
+                                        event: "add_to_cart",
+                                        ecommerce: {
+                                            currency: "UAH",
+                                            items: items
+                                        }
+                                    });
+                                }
+                            } catch (e) {
+                                console.error('GA4 add_to_cart error:', e);
+                            }
+                        }
+                    }
+                });
+            })();
+        </script>
+        <?php
+    }
+
+    /* ======================================================
+     * CORE VIEW ITEM LIST
+     * ====================================================== */
+
+    private function output_view_item_list($context) {
+        global $wp_query;
+        if (empty($wp_query->posts)) return;
 
         $items = [];
         $index = 1;
@@ -201,15 +275,12 @@ class WC_GA4_Ecommerce_Events {
         $this->print_datalayer('view_item_list', $items);
     }
 
-    /**
-     * =========================
-     * PRINT DATALAYER
-     * =========================
-     */
+    /* ======================================================
+     * HELPERS
+     * ====================================================== */
+
     private function print_datalayer($event, $items) {
-        if (empty($items)) {
-            return;
-        }
+        if (empty($items)) return;
 ?>
         <script>
             window.dataLayer = window.dataLayer || [];
@@ -227,11 +298,6 @@ class WC_GA4_Ecommerce_Events {
 <?php
     }
 
-    /**
-     * =========================
-     * PRODUCT CATEGORIES HELPER
-     * =========================
-     */
     private function get_product_categories($product) {
 
         $terms = get_the_terms($product->get_id(), 'product_cat');
@@ -256,31 +322,20 @@ class WC_GA4_Ecommerce_Events {
         return [$cat1, $cat2];
     }
 
-    /**
-     * =========================
-     * LIST META
-     * =========================
-     */
     private function get_list_id($context) {
-        switch ($context) {
-            case 'shop_page':
-                return 'shop_page';
-            case 'category_page':
-                return 'category_page';
-            case 'search_page':
-                return 'search_page';
-        }
+        return match ($context) {
+            'shop_page'     => 'shop_page',
+            'category_page' => 'category_page',
+            'search_page'   => 'search_page',
+        };
     }
 
     private function get_list_name($context) {
-        switch ($context) {
-            case 'shop_page':
-                return 'Shop Page';
-            case 'category_page':
-                return 'Category Page';
-            case 'search_page':
-                return 'Search Page';
-        }
+        return match ($context) {
+            'shop_page'     => 'Shop Page',
+            'category_page' => 'Category Page',
+            'search_page'   => 'Search Page',
+        };
     }
 }
 

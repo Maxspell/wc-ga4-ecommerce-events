@@ -15,6 +15,7 @@ if (!defined('ABSPATH')) {
 class WC_GA4_Ecommerce_Events {
 
     private $add_to_cart_items = [];
+    private $remove_from_cart_items = [];
 
     public function __construct() {
 
@@ -34,6 +35,7 @@ class WC_GA4_Ecommerce_Events {
         // view_item – single product
         add_action('wp_footer', [$this, 'view_item_single_product'], 20);
 
+
         // add_to_cart – capture (works for both AJAX and non-AJAX)
         add_action('woocommerce_add_to_cart', [$this, 'capture_add_to_cart'], 10, 6);
 
@@ -45,6 +47,19 @@ class WC_GA4_Ecommerce_Events {
 
         // add_to_cart – JavaScript for AJAX handling
         add_action('wp_footer', [$this, 'add_to_cart_ajax_script'], 10);
+
+
+        // remove_from_cart – capture BEFORE item is removed (to get product data)
+        add_action('woocommerce_remove_cart_item', [$this, 'capture_remove_from_cart'], 10, 2);
+
+        // remove_from_cart – output (non-AJAX)
+        add_action('wp_footer', [$this, 'output_remove_from_cart'], 35);
+
+        // remove_from_cart – AJAX: add to get_refreshed_fragments response
+        add_filter('woocommerce_add_to_cart_fragments', [$this, 'remove_from_cart_fragments'], 10, 1);
+
+        // remove_from_cart – JS handler
+        add_action('wp_footer', [$this, 'remove_from_cart_ajax_script'], 15);
     }
 
     /* ======================================================
@@ -236,6 +251,152 @@ class WC_GA4_Ecommerce_Events {
                 });
             })();
         </script>
+        <?php
+    }
+
+    /* ======================================================
+     * REMOVE FROM CART – CAPTURE (BEFORE REMOVAL)
+     * ====================================================== */
+
+    public function capture_remove_from_cart($cart_item_key, $cart) {
+
+        // Get cart contents directly (item still exists at this point)
+        $cart_contents = $cart->cart_contents;
+        
+        if (empty($cart_contents[$cart_item_key])) {
+            return;
+        }
+        
+        $cart_item = $cart_contents[$cart_item_key];
+        $product = $cart_item['data'] ?? null;
+        
+        if (!$product instanceof WC_Product) {
+            return;
+        }
+
+        [$cat1, $cat2] = $this->get_product_categories($product);
+
+        $item_data = [
+            'item_id'       => (string) $product->get_id(),
+            'item_name'     => $product->get_name(),
+            'price'         => (float) $product->get_price(),
+            'item_brand'    => $product->get_attribute('pa_brand') ?: '',
+            'item_category' => $cat1,
+            'item_variant'  => $product->get_attribute('pa_color') ?: '',
+            'quantity'      => (int) ($cart_item['quantity'] ?? 1),
+        ];
+
+        $this->remove_from_cart_items[] = $item_data;
+
+        // Also store in WC session for AJAX fragment retrieval
+        if (WC()->session) {
+            $session_items = WC()->session->get('ga4_remove_from_cart_items', []);
+            $session_items[] = $item_data;
+            WC()->session->set('ga4_remove_from_cart_items', $session_items);
+        }
+    }
+
+
+    /* ======================================================
+     * REMOVE FROM CART – OUTPUT
+     * ====================================================== */
+
+    public function output_remove_from_cart() {
+
+        // Try class property first, then WC session
+        $items = $this->remove_from_cart_items;
+        
+        if (empty($items) && WC()->session) {
+            $items = WC()->session->get('ga4_remove_from_cart_items', []);
+        }
+
+        if (empty($items)) {
+            return;
+        }
+
+        $this->print_datalayer('remove_from_cart', $items);
+        
+        // Clear both storage locations
+        $this->remove_from_cart_items = [];
+        if (WC()->session) {
+            WC()->session->set('ga4_remove_from_cart_items', []);
+        }
+    }
+
+    /* ======================================================
+     * REMOVE FROM CART – AJAX FRAGMENTS SUPPORT
+     * ====================================================== */
+
+    public function remove_from_cart_fragments($fragments) {
+
+        // Try to get items from class property first, then from WC session
+        $items = $this->remove_from_cart_items;
+        
+        if (empty($items) && WC()->session) {
+            $items = WC()->session->get('ga4_remove_from_cart_items', []);
+        }
+
+        if (!empty($items)) {
+            $fragments['div#ga4-remove-from-cart-data'] =
+                '<div id="ga4-remove-from-cart-data" style="display:none;" data-items="' .
+                esc_attr(wp_json_encode($items, JSON_UNESCAPED_UNICODE)) .
+                '"></div>';
+            
+            // Clear both storage locations
+            $this->remove_from_cart_items = [];
+            if (WC()->session) {
+                WC()->session->set('ga4_remove_from_cart_items', []);
+            }
+        } else {
+            $fragments['div#ga4-remove-from-cart-data'] =
+                '<div id="ga4-remove-from-cart-data" style="display:none;"></div>';
+        }
+
+        return $fragments;
+    }
+
+
+    /* ======================================================
+     * REMOVE FROM CART – AJAX JAVASCRIPT HANDLER
+     * ====================================================== */
+
+    public function remove_from_cart_ajax_script() {
+        ?>
+        <div id="ga4-remove-from-cart-data" style="display:none;"></div>
+            <script>
+            (function() {
+
+                jQuery(document.body).on('removed_from_cart', function(event, fragments) {
+
+                    if (!fragments || !fragments['div#ga4-remove-from-cart-data']) return;
+
+                    var temp = document.createElement('div');
+                    temp.innerHTML = fragments['div#ga4-remove-from-cart-data'];
+
+                    var el = temp.querySelector('#ga4-remove-from-cart-data');
+                    if (!el || !el.dataset.items) return;
+
+                    try {
+                        var items = JSON.parse(el.dataset.items);
+                        if (!items.length) return;
+
+                        window.dataLayer = window.dataLayer || [];
+                        dataLayer.push({ ecommerce: null });
+                        dataLayer.push({
+                            event: "remove_from_cart",
+                            ecommerce: {
+                                currency: "UAH",
+                                items: items
+                            }
+                        });
+
+                    } catch (e) {
+                        console.error('GA4 remove_from_cart error:', e);
+                    }
+                });
+
+            })();
+            </script>
         <?php
     }
 

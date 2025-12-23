@@ -63,6 +63,16 @@ class WC_GA4_Ecommerce_Events {
 
         // begin_checkout
         add_action('wp_footer', [$this, 'begin_checkout_event'], 20);
+
+        // purchase - зберегти дані при створенні замовлення
+        add_action('woocommerce_checkout_order_processed', [$this, 'store_purchase_data'], 10, 1);
+
+        // purchase - вивести JS для обробки AJAX checkout
+        add_action('wp_footer', [$this, 'purchase_ajax_script'], 25);
+
+        // purchase - AJAX endpoint для отримання даних
+        add_action('wp_ajax_ga4_get_purchase_data', [$this, 'ajax_get_purchase_data']);
+        add_action('wp_ajax_nopriv_ga4_get_purchase_data', [$this, 'ajax_get_purchase_data']);
     }
 
     /* ======================================================
@@ -285,6 +295,7 @@ class WC_GA4_Ecommerce_Events {
             'price'         => (float) $product->get_price(),
             'item_brand'    => $product->get_attribute('pa_brand') ?: '',
             'item_category' => $cat1,
+            'item_category2' => $cat2,
             'item_variant'  => $product->get_attribute('pa_color') ?: '',
             'quantity'      => (int) ($cart_item['quantity'] ?? 1),
         ];
@@ -357,7 +368,6 @@ class WC_GA4_Ecommerce_Events {
 
         return $fragments;
     }
-
 
     /* ======================================================
      * REMOVE FROM CART – AJAX JAVASCRIPT HANDLER
@@ -502,6 +512,131 @@ class WC_GA4_Ecommerce_Events {
             <?php
     }
 
+    /**
+     * Зберігає дані purchase для AJAX-передачі
+     */
+    public function store_purchase_data($order_id) {
+
+        if (!$order_id) return;
+
+        $order = wc_get_order($order_id);
+        if (!$order) return;
+
+        $items = [];
+
+        foreach ($order->get_items() as $item) {
+
+            $product = $item->get_product();
+            if (!$product) continue;
+
+            [$cat1, $cat2] = $this->get_product_categories($product);
+
+            $items[] = [
+                'item_id'        => (string) $product->get_id(),
+                'item_name'      => $product->get_name(),
+                'price'          => (float) $order->get_item_total($item, false),
+                'item_brand'     => $product->get_attribute('pa_brand') ?: '',
+                'item_category'  => $cat1,
+                'item_category2' => $cat2,
+                'item_variant'   => $product->get_attribute('pa_color') ?: '',
+                'quantity'       => (int) $item->get_quantity(),
+                'google_business_vertical' => 'retail',
+            ];
+        }
+
+        if (empty($items)) return;
+
+        $purchase_data = [
+            'transaction_id' => $order->get_order_number(),
+            'value'          => (float) $order->get_total(),
+            'currency'       => $order->get_currency(),
+            'items'          => $items,
+        ];
+
+        // Зберігаємо в сесію WooCommerce
+        if (WC()->session) {
+            WC()->session->set('ga4_purchase_data', $purchase_data);
+        }
+    }
+
+    /**
+     * JavaScript для відправки purchase події при успішному AJAX checkout
+     */
+    public function purchase_ajax_script() {
+        if (!is_checkout()) return;
+        ?>
+        <script>
+            (function($) {
+                'use strict';
+
+                var ga4PurchaseSent = false;
+
+                // Функція для відправки purchase події
+                function sendPurchaseEvent() {
+                    if (ga4PurchaseSent) return;
+
+                    $.ajax({
+                        url: '<?php echo admin_url('admin-ajax.php'); ?>',
+                        type: 'POST',
+                        data: {
+                            action: 'ga4_get_purchase_data'
+                        },
+                        success: function(data) {
+                            if (data && data.success && data.data) {
+                                window.dataLayer = window.dataLayer || [];
+                                dataLayer.push({ ecommerce: null });
+                                dataLayer.push({
+                                    event: 'purchase',
+                                    ecommerce: data.data
+                                });
+                                console.log('GA4 purchase event pushed', data.data);
+                                ga4PurchaseSent = true;
+                            }
+                        },
+                        error: function() {
+                            console.error('GA4 purchase: failed to get data');
+                        }
+                    });
+                }
+
+                // Перехоплення через jQuery AJAX global events
+                $(document).ajaxComplete(function(event, xhr, settings) {
+                    // Перевіряємо чи це checkout запит
+                    if (settings.url && settings.url.indexOf('wc-ajax=checkout') !== -1) {
+                        try {
+                            var response = xhr.responseJSON || JSON.parse(xhr.responseText);
+                            if (response && response.result === 'success') {
+                                sendPurchaseEvent();
+                            }
+                        } catch (e) {
+                            // Ignore parse errors
+                        }
+                    }
+                });
+
+            })(jQuery);
+        </script>
+        <?php
+    }
+
+    /**
+     * AJAX endpoint для отримання даних purchase
+     */
+    public function ajax_get_purchase_data() {
+        $data = null;
+
+        if (WC()->session) {
+            $data = WC()->session->get('ga4_purchase_data');
+            // Очищаємо після отримання
+            WC()->session->set('ga4_purchase_data', null);
+        }
+
+        if ($data) {
+            wp_send_json_success($data);
+        } else {
+            wp_send_json_error('No purchase data found');
+        }
+    }
 
     /* ======================================================
      * HELPERS
@@ -528,17 +663,36 @@ class WC_GA4_Ecommerce_Events {
 
     private function get_product_categories($product) {
 
-        $terms = get_the_terms($product->get_id(), 'product_cat');
+        // Для варіацій - отримуємо категорії батьківського товару
+        $product_id = $product->get_id();
+        
+        if ($product->is_type('variation')) {
+            $parent_id = $product->get_parent_id();
+            if ($parent_id) {
+                $product_id = $parent_id;
+            }
+        }
+
+        $terms = get_the_terms($product_id, 'product_cat');
         $cat1 = '';
         $cat2 = '';
 
-        if ($terms) {
+        if ($terms && !is_wp_error($terms)) {
+            // Спочатку шукаємо кореневу категорію (parent == 0)
             foreach ($terms as $term) {
                 if ($term->parent == 0) {
                     $cat1 = $term->name;
                     break;
                 }
             }
+            
+            // Якщо кореневої категорії немає - беремо першу доступну
+            if (empty($cat1) && !empty($terms)) {
+                $first_term = reset($terms);
+                $cat1 = $first_term->name;
+            }
+            
+            // Шукаємо другу категорію (відмінну від першої)
             foreach ($terms as $term) {
                 if ($term->name !== $cat1) {
                     $cat2 = $term->name;

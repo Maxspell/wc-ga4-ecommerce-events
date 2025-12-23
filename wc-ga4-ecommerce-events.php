@@ -3,7 +3,7 @@
 /**
  * Plugin Name: WooCommerce GA4 Ecommerce Events
  * Description: Scalable GA4 ecommerce events integration for WooCommerce (view_item_list, view_item, add_to_cart, remove_from_cart, begin_checkout, purchase).
- * Version: 1.4.0
+ * Version: 1.5.0
  * Author: Your Team
  * Text Domain: wc-ga4-ecommerce-events
  */
@@ -60,6 +60,9 @@ class WC_GA4_Ecommerce_Events {
 
         // remove_from_cart – JS handler
         add_action('wp_footer', [$this, 'remove_from_cart_ajax_script'], 15);
+
+        // begin_checkout
+        add_action('wp_footer', [$this, 'begin_checkout_event'], 20);
     }
 
     /* ======================================================
@@ -435,6 +438,70 @@ class WC_GA4_Ecommerce_Events {
 
         $this->print_datalayer('view_item_list', $items);
     }
+
+    /* ======================================================
+     * CORE BEGIN CHECKOUT
+     * ====================================================== */
+
+    public function begin_checkout_event() {
+
+        if (!is_checkout() || is_order_received_page()) {
+            return;
+        }
+
+        if (!WC()->cart || WC()->cart->is_empty()) {
+            return;
+        }
+
+        $items = [];
+
+        foreach (WC()->cart->get_cart() as $cart_item) {
+
+            $product = $cart_item['data'] ?? null;
+            if (!$product instanceof WC_Product) continue;
+
+            [$cat1, $cat2] = $this->get_product_categories($product);
+
+            $items[] = [
+                'item_id'        => (string) $product->get_id(),
+                'item_name'      => $product->get_name(),
+                'price'          => (float) $product->get_price(),
+                'item_brand'     => $product->get_attribute('pa_brand') ?: '',
+                'item_category'  => $cat1,
+                'item_category2' => $cat2,
+                'item_variant'   => $product->get_attribute('pa_color') ?: '',
+                'quantity'       => (int) ($cart_item['quantity'] ?? 1),
+                'google_business_vertical' => 'retail',
+            ];
+        }
+
+        if (empty($items)) return;
+            ?>
+            <script>
+                (function() {
+
+                    // fire only once per session
+                    if (sessionStorage.getItem('ga4_begin_checkout_fired')) {
+                        return;
+                    }
+
+                    sessionStorage.setItem('ga4_begin_checkout_fired', '1');
+
+                    window.dataLayer = window.dataLayer || [];
+                    dataLayer.push({ ecommerce: null });
+                    dataLayer.push({
+                        event: "begin_checkout",
+                        ecommerce: {
+                            currency: "UAH",
+                            items: <?php echo wp_json_encode($items, JSON_UNESCAPED_UNICODE); ?>
+                        }
+                    });
+
+                })();
+            </script>
+            <?php
+    }
+
 
     /* ======================================================
      * HELPERS
